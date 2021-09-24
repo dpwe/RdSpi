@@ -23,7 +23,6 @@
 #include "cmd.h"
 #include "cli.h"
 #include "pi2c.h"
-#include "rpi_pin.h"
 #include "si4703.h"
 
 cmd_t commands[] = {
@@ -93,8 +92,6 @@ int main(int argc, char **argv)
 	stdio_init(&cli, stdio_cli_handler);
 	stdio_mode(STDIO_MODE_RAW);
 
-	rpi_pin_init(RPI_REV2);
-	rpi_pin_export(SI_RESET, RPI_INPUT);
 	pi2c_open(PI2C_BUS);
 	pi2c_select(PI2C_BUS, SI4703_ADDR);
 
@@ -123,7 +120,6 @@ int main(int argc, char **argv)
 	}
 
 restore:
-	rpi_pin_unexport(SI_RESET);
 	pi2c_close(PI2C_BUS);
 	stdio_mode(STDIO_MODE_CANON);
 

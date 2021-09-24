@@ -68,10 +68,12 @@ int cmd_reset(int fd, UNUSED(char *arg))
 	uint16_t si_regs[16];
 	si_read_regs(si_regs);
 
-	rpi_pin_set_dir(SI_RESET, RPI_OUTPUT);
+	rpi_pin_init(RPI_REV2);
+	rpi_pin_export(SI_RESET, RPI_OUTPUT);
 	rpi_pin_set(SI_RESET, 0);
 	rpi_delay_ms(10);
-	rpi_pin_set_dir(SI_RESET, RPI_INPUT);
+	rpi_pin_set(SI_RESET, 1);
+	rpi_pin_unexport(SI_RESET);
 	rpi_delay_ms(1);
 
 	if (si_read_regs(si_regs) != 0) {
