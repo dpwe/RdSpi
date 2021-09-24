@@ -427,9 +427,35 @@ static const char cur_hid[] = { 27, '[', '?', '2', '5', 'l','\0' }; // hide curs
 static const char txt_nor[] = { 27, '[', '0', 'm', '\0' }; // normal text
 static const char txt_rev[] = { 27, '[', '7', 'm', '\0' }; // reverse text
 
+
+static void pi_to_station_id(int pi, char *sid)
+{
+  // See http://www.interactive-radio-system.com/docs/rbds1998.pdf sec D.6.1
+  if (pi >= 21672) {
+	sid[0] = 'W';
+	pi -= 21672;
+  } else if (pi >= 4096) {
+	sid[0] = 'K';
+  } else {
+	// Doesn't look like an NA PI
+	sid[0] = '?';
+	// but try and decode anyway.
+  }
+  // Encoding is base-26
+  for (int i = 0; i < 3; ++i) {
+	sid[3 - i] = 'A' + pi % 26;
+	pi /= 26;
+  }
+}
+
 static void print_rds_hdr(int fd, rds_hdr_t *phdr)
 {
 	dprintf(fd, "%04X %04X %04X %04X ", phdr->rds[0], phdr->rds[1], phdr->rds[2], phdr->rds[3]);
+	// dpwe: North-America call-sign encoding.
+	char station_id[5];
+	station_id[4] = '\0';
+	pi_to_station_id(phdr->rds[0], station_id);
+	dprintf(fd, "| %s ", station_id);
 	dprintf(fd, "| GT %02d%c PTY %2d TP %d | ", phdr->gt, 'A' + phdr->ver, phdr->pty, phdr->tp);
 }
 
