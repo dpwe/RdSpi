@@ -27,8 +27,8 @@
 #include "si4703.h"
 #include "rpi_pin.h"
 
-#define RSSI_LIMIT 35
-#define DEFAULT_STATION 9500 // Local station with the good signal strength
+#define RSSI_LIMIT 15
+#define DEFAULT_STATION 9390 // Local station with the good signal strength
 
 inline const char *is_on(uint16_t mask)
 {
@@ -168,6 +168,29 @@ static int get_ps_si(char *ps_name, uint16_t *regs, int timeout)
 	return -1;
 }
 
+static void pi_to_station_id(int pi, char *station_id)
+{
+  // station_id points to a char[5] array.
+  // See http://www.interactive-radio-system.com/docs/rbds1998.pdf sec D.6.1
+  if (pi >= 21672) {
+	station_id[0] = 'W';
+	pi -= 21672;
+  } else if (pi >= 4096) {
+	station_id[0] = 'K';
+  } else {
+	// Doesn't look like an NA PI
+	station_id[0] = '?';
+	// but try and decode anyway.
+  }
+  // Encoding is base-26
+  for (int i = 0; i < 3; ++i) {
+	station_id[3 - i] = 'A' + pi % 26;
+	pi /= 26;
+  }
+  // Terminate the string.
+  station_id[4] = '\0';
+}
+
 int cmd_scan(int fd, char *arg)
 {
 	uint8_t mode = 0;
@@ -179,7 +202,8 @@ int cmd_scan(int fd, char *arg)
 		return CLI_ENODEV;
 
 	si_regs[POWERCFG] |= SKMODE; // stop seeking at the upper or lower band limit
-
+	si_regs[POWERCFG] |= RDSM;   // Always scan with RDS in Verbose mode.
+	
 	// mode as recommended in AN230, Table 23. Summary of Seek Settings
 	if (arg && *arg) {
 		mode = atoi(arg);
@@ -229,32 +253,48 @@ int cmd_scan(int fd, char *arg)
 		seek = freq;
 		nstations++;
 		uint8_t rssi = si_regs[STATUSRSSI]	& RSSI;
-		dprintf(fd, "%5d ", freq);
-		for(int si = 0; si < rssi; si++)
-			dprintf(fd, "-");
-		dprintf(fd, " %d", rssi);
-
+		
+		uint8_t st = 0, rds = 0, blera = 99;
+		uint8_t seen_rdsr_low = 0;
+		uint16_t pi = 0;
 		int dt = 0;
 		if (rssi > RSSI_LIMIT) {
-			while(dt < 10000) {
+		  while(dt < 1000) {
 				si_read_regs(si_regs);
-				if (si_regs[STATUSRSSI] & STEREO) break;
-				if (is_stop(&stop)) break;
+				// We have to wait for NOT(RDSR) to avoid re-reading the RDS from the previous station.
+				if ((si_regs[STATUSRSSI] & RDSR) == 0)
+				  seen_rdsr_low = 1;
+				if (si_regs[STATUSRSSI] & STEREO)
+				  st = 1;
+				// We have to wait for RDSS (sync) *and* a newly-ready RDS read (RDSR)
+				// before we can try to read the PI (program identifier code).
+				if (seen_rdsr_low &&
+					(si_regs[STATUSRSSI] & (RDSS | RDSR)) == (RDSS | RDSR)) {
+				  rds = 1;
+				  // Read the RDS A bit error rate.
+				  uint8_t this_blera = (si_regs[STATUSRSSI] & BLERA) >> 9; // / (BLERA & (~(BLERA << 1)));
+				  if (this_blera < blera) {
+					// Record the PI from the read with the lowest bit error rate.
+					// In theory, any blera < 3 should be error-corrected.
+					pi = si_regs[RDSA];
+					blera = this_blera;
+				  }
+				}
+				// If we've had a zero-error read of the PI RDS, we can stop checking.
+				if ((blera == 0) || is_stop(&stop)) break;
 				rpi_delay_ms(10);
 				dt += 10;
 			}
 		}
-		uint16_t st = si_regs[STATUSRSSI] & STEREO;
-
-		if (st) {
-			dprintf(fd, " ST");
-			if (rssi > RSSI_LIMIT) {
-				int pi;
-				char ps_name[16];
-				if ((pi = get_ps_si(ps_name, si_regs, 5000)) != -1)
-					dprintf(fd, " %04X '%s'", pi, ps_name);
-			}
+		
+		char station_id[] = "----";
+		if (rds) {
+		  pi_to_station_id(pi, station_id);
 		}
+		dprintf(fd, "%s %s %5d ", station_id, st ? "ST" : "  ", freq);
+		for(int si = 0; si < rssi; si++)
+			dprintf(fd, "-");
+		dprintf(fd, " %d", rssi);
 		dprintf(fd, "\n");
 	}
 	
@@ -327,8 +367,11 @@ int cmd_spectrum(int fd, char *arg)
 			if (rssi > rssi_limit) {
 				int pi;
 				char ps_name[16];
-				if ((pi = get_ps_si(ps_name, si_regs, 5000)) != -1)
-					dprintf(fd, " %04X '%s'", pi, ps_name);
+				if ((pi = get_ps_si(ps_name, si_regs, 5000)) != -1) {
+				  char station_id[5];
+				  pi_to_station_id(pi, station_id);
+				  dprintf(fd, " %04X %s '%s'", pi, station_id, ps_name);
+				}
 			}
 		}
 		dprintf(fd, "\n");
@@ -428,32 +471,11 @@ static const char txt_nor[] = { 27, '[', '0', 'm', '\0' }; // normal text
 static const char txt_rev[] = { 27, '[', '7', 'm', '\0' }; // reverse text
 
 
-static void pi_to_station_id(int pi, char *sid)
-{
-  // See http://www.interactive-radio-system.com/docs/rbds1998.pdf sec D.6.1
-  if (pi >= 21672) {
-	sid[0] = 'W';
-	pi -= 21672;
-  } else if (pi >= 4096) {
-	sid[0] = 'K';
-  } else {
-	// Doesn't look like an NA PI
-	sid[0] = '?';
-	// but try and decode anyway.
-  }
-  // Encoding is base-26
-  for (int i = 0; i < 3; ++i) {
-	sid[3 - i] = 'A' + pi % 26;
-	pi /= 26;
-  }
-}
-
 static void print_rds_hdr(int fd, rds_hdr_t *phdr)
 {
 	dprintf(fd, "%04X %04X %04X %04X ", phdr->rds[0], phdr->rds[1], phdr->rds[2], phdr->rds[3]);
 	// dpwe: North-America call-sign encoding.
 	char station_id[5];
-	station_id[4] = '\0';
 	pi_to_station_id(phdr->rds[0], station_id);
 	dprintf(fd, "| %s ", station_id);
 	dprintf(fd, "| GT %02d%c PTY %2d TP %d | ", phdr->gt, 'A' + phdr->ver, phdr->pty, phdr->tp);
