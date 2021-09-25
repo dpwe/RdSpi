@@ -457,6 +457,61 @@ static void print_rds(int fd, rds_hdr_t *phdr, int log)
 	dprintf(fd, "%s\n", log ? "" : clr_eol);
 }
 
+static void content_type_to_string(int content_type, char *output)
+{
+  if (content_type == 1) {
+	strcpy(output, "Title");
+  } else if (content_type == 2) {
+	strcpy(output, "Album");
+  } else if (content_type == 3) {
+	strcpy(output, "Track");
+  } else if (content_type == 4) {
+	strcpy(output, "Artist");
+  } else if (content_type == 31) {
+	strcpy(output, "StationNick");
+  } else if (content_type == 32) {
+	strcpy(output, "StationName");
+  } else {
+	sprintf(output, "Type%d", content_type);
+  }
+}
+
+static void display_rtplus(int fd, uint16_t *rds, char *radiotext)
+{
+  // RadioText+ payload.
+  // See https://tech.ebu.ch/docs/techreview/trev_307-radiotext.pdf
+  uint8_t item_toggle_bit = (rds[1] & 0x10) >> 4;
+  uint8_t item_running_bit = (rds[1] & 0x08) >> 3;
+  uint8_t content_type_1 = ((rds[1] & 0x07) << 3)
+	+ ((rds[2] & 0xE000) >> 13);
+  uint8_t start_marker_1 = (rds[2] & 0x1F80) >> 7;
+  uint8_t length_marker_1 = 1 + ((rds[2] & 0x007E) >> 1);
+  uint8_t content_type_2 = ((rds[2] & 0x01) << 5)
+	+ ((rds[3] & 0xF800) >> 11);
+  uint8_t start_marker_2 = (rds[3] & 0x07E0) >> 5;
+  uint8_t length_marker_2 = 1 + (rds[3] & 0x001F);
+  //dprintf(fd, "it %d ir %d t1 %d s1 %d l1 %d t2 %d s2 %d l2 %d\n",
+  //	  item_toggle_bit, item_running_bit,
+  //	  content_type_1, start_marker_1, length_marker_1, 
+  //	  content_type_2, start_marker_2, length_marker_2);
+  char msg1[66], msg2[66], type1[16], type2[16];
+  strncpy(msg1, radiotext + start_marker_1, length_marker_1);
+  msg1[length_marker_1] = '\0';
+  content_type_to_string(content_type_1, type1);
+  strncpy(msg2, radiotext + start_marker_2, length_marker_2);
+  msg2[length_marker_2] = '\0';
+  content_type_to_string(content_type_2, type2);
+  dprintf(fd, "ItRun %d%c %s:'%s' %s:'%s'\n",
+		  item_running_bit, item_toggle_bit ? '/' : '\\',
+		  type1, msg1, type2, msg2); 
+  // Content types: see https://pira.cz/rds/rtpclass.pdf
+  // also https://github.com/windytan/redsea/blob/master/schema.json#L42
+  //   1 Title
+  //   4 Artist
+  //  31 Station Callsign
+  //  32 Station Name
+}
+
 static void cmd_monitor_si(int fd, uint16_t *regs, uint16_t pr_mask, uint32_t timeout, int log)
 { 
 	rds_gt00a_t rd0;
@@ -485,7 +540,9 @@ static void cmd_monitor_si(int fd, uint16_t *regs, uint16_t pr_mask, uint32_t ti
 	uint16_t rt_mask  = 0; // mask of radiotext segments processed
 	uint16_t ps_mask  = 0;
 	uint32_t endTime  = 0;
-
+	uint16_t rtp_gt = 0;   // group type holding RadioText+ info
+	uint16_t rtp_mask = 0; // mask for GT holding RadioText+ messages
+	
 	if (!log) {
 		dprintf(fd, "%s%s%s", clr_all, go_top, cur_hid);
 		dprintf(fd, "monitoring RDS, press any key to terminate...%s%s\n", clr_eol, txt_nor);
@@ -507,64 +564,78 @@ static void cmd_monitor_si(int fd, uint16_t *regs, uint16_t pr_mask, uint32_t ti
 			memcpy(hdr.rds, &regs[RDSA], sizeof(hdr.rds));
 			memcpy(&rds[gt], &hdr, sizeof(hdr));
 
+			// Check error rates.
+			uint8_t blera, blerb, blerc, blerd;
+			blera = (regs[STATUSRSSI] & BLERA) / (BLERA & (~(BLERA << 1)));
+			blerb = (regs[READCHAN] & BLERB) / (BLERB & (~(BLERB << 1)));
+			blerc = (regs[READCHAN] & BLERC) / (BLERC & (~(BLERC << 1)));
+			blerd = (regs[READCHAN] & BLERD) / (BLERD & (~(BLERD << 1)));
+			
 			gt_mask |= _BM(gt);
-			if (!ver)
-				gta_mask |= _BM(gt);
-			else
-				gtb_mask |= _BM(gt);
-
 			if (!log) {
 				dprintf(fd, "%s%s", go_top, txt_rev);
 				print_rds_hdr(fd, &hdr);
-				dprintf(fd, "monitoring RDS, press any key to terminate...%s%s\n", clr_eol, txt_nor);
+				dprintf(fd, "monitoring RDS, press any key to terminate A %d B %d C %d D %d...%s%s\n", blera, blerb, blerc, blerd, clr_eol, txt_nor);
 			}
 
-			// 0A: basic tuning and switching information
-			if (gtv == RDS_GT_00A) {
-				memcpy(&rd0.hdr, &hdr, sizeof(hdr));
-				rds_parse_gt00a(&regs[RDSA], &rd0);
-			}
-			// 1A: Program Item Number and slow labeling codes
-			if (gtv == RDS_GT_01A) {
-				memcpy(&rd1.hdr, &hdr, sizeof(hdr));
-				rds_parse_gt01a(&regs[RDSA], &rd1);
-			}
-			// 2A: Radiotext
-			if (gtv == RDS_GT_02A) {
-				memcpy(&rd2.hdr, &hdr, sizeof(hdr));
-				rds_parse_gt02a(&regs[RDSA], &rd2);
-			}
-			// 3A: AID for ODA
-			if (gtv == RDS_GT_03A) {
-				memcpy(&rd3.hdr, &hdr, sizeof(hdr));
-				rds_parse_gt03a(&regs[RDSA], &rd3);
-			}
-			// 4A: Clock-time and date
-			if (gtv == RDS_GT_04A) {
-				memcpy(&rd4.hdr, &hdr, sizeof(hdr));
-				rds_parse_gt04a(&regs[RDSA], &rd4);
-			}
-			// 5A: Transparent data channels or ODA
-			if (gtv == RDS_GT_05A) {
-				memcpy(&rd5.hdr, &hdr, sizeof(hdr));
-				rds_parse_gt05a(&regs[RDSA], &rd5);
-			}
-			// 8A: Traffic Message Channel
-			if (gtv == RDS_GT_08A) {
-				memcpy(&rd8.hdr, &hdr, sizeof(hdr));
-				rds_parse_gt08a(&regs[RDSA], &rd8);
-			}
-			// 10A: Program Type Name
-			if (gtv == RDS_GT_10A) {
-				memcpy(&rd10.hdr, &hdr, sizeof(hdr));
-				rds_parse_gt10a(&regs[RDSA], &rd10);
-			}
-			// 14A: Enhanced Other Networks information
-			if (gtv == RDS_GT_14A) {
-				memcpy(&rd14.hdr, &hdr, sizeof(hdr));
-				rds_parse_gt14a(&regs[RDSA], &rd14);
-			}
+#define MAX_BLER 0
+			if (blera <= MAX_BLER &&
+				blerb <= MAX_BLER &&
+				blerc <= MAX_BLER &&
+				blerd <= MAX_BLER) {
+			
+			  if (!ver)
+				gta_mask |= _BM(gt);
+			  else
+				gtb_mask |= _BM(gt);
 
+			  // 0A: basic tuning and switching information
+			  if (gtv == RDS_GT_00A) {
+				  memcpy(&rd0.hdr, &hdr, sizeof(hdr));
+				  rds_parse_gt00a(&regs[RDSA], &rd0);
+			  }
+			  // 1A: Program Item Number and slow labeling codes
+			  if (gtv == RDS_GT_01A) {
+				  memcpy(&rd1.hdr, &hdr, sizeof(hdr));
+				  rds_parse_gt01a(&regs[RDSA], &rd1);
+			  }
+			  // 2A: Radiotext
+			  if (gtv == RDS_GT_02A) {
+				  memcpy(&rd2.hdr, &hdr, sizeof(hdr));
+				  rds_parse_gt02a(&regs[RDSA], &rd2);
+			  }
+			  // 3A: AID for ODA
+			  if (gtv == RDS_GT_03A) {
+				  memcpy(&rd3.hdr, &hdr, sizeof(hdr));
+				  rds_parse_gt03a(&regs[RDSA], &rd3);
+			  }
+			  // 4A: Clock-time and date
+			  if (gtv == RDS_GT_04A) {
+				  memcpy(&rd4.hdr, &hdr, sizeof(hdr));
+				  rds_parse_gt04a(&regs[RDSA], &rd4);
+			  }
+			  // 5A: Transparent data channels or ODA
+			  if (gtv == RDS_GT_05A) {
+				  memcpy(&rd5.hdr, &hdr, sizeof(hdr));
+				  rds_parse_gt05a(&regs[RDSA], &rd5);
+			  }
+			  // 8A: Traffic Message Channel
+			  if (gtv == RDS_GT_08A) {
+				  memcpy(&rd8.hdr, &hdr, sizeof(hdr));
+				  rds_parse_gt08a(&regs[RDSA], &rd8);
+			  }
+			  // 10A: Program Type Name
+			  if (gtv == RDS_GT_10A) {
+				  memcpy(&rd10.hdr, &hdr, sizeof(hdr));
+				  rds_parse_gt10a(&regs[RDSA], &rd10);
+			  }
+			  // 14A: Enhanced Other Networks information
+			  if (gtv == RDS_GT_14A) {
+				  memcpy(&rd14.hdr, &hdr, sizeof(hdr));
+				  rds_parse_gt14a(&regs[RDSA], &rd14);
+			  }
+			}
+			  
 			rpi_delay_ms(40); // Wait for the RDS bit to clear, from AN230
 			endTime += 40;
 
@@ -618,6 +689,19 @@ static void cmd_monitor_si(int fd, uint16_t *regs, uint16_t pr_mask, uint32_t ti
 					if (rd3.m)
 						dprintf(fd, "G %d Ta %d Tw %d Td %d", rd3.g, rd3.ta, rd3.tw, rd3.td);
 				}
+
+				// Specific app types
+				if (rd3.aid == 19415 /* 0x4BD7 */ ) {
+				  // RadioTextPlus (RT+)
+				  // Where is the RT+ info stored?
+				  rtp_gt = rd3.agtc;
+				  rtp_mask = 1 << rtp_gt;
+				  dprintf(fd, " RT+");
+				} else if (rd3.aid == 52550 /* 0xcd46 */ || rd3.aid == 52551 /* 0xcd47 */) {
+				  // TMC (Traffic Message Channel)
+				  dprintf(fd, " TMC");
+				}
+				// For inspiration: https://github.com/windytan/redsea/blob/master/src/groups.cc#L534
 				dprintf(fd, "%s\n", log ? "" : clr_eol);
 			}
 
@@ -644,10 +728,10 @@ static void cmd_monitor_si(int fd, uint16_t *regs, uint16_t pr_mask, uint32_t ti
 			}
 
 			if (mask & _BM(6))
-				print_rds(fd, &rds[6], log);
+			  print_rds(fd, &rds[6], log);
 
 			if (mask & _BM(7))
-				print_rds(fd, &rds[7], log);
+			  print_rds(fd, &rds[7], log);
 			
 			if (mask & _BM(8)) {
 				// check if 8A is Alert-C 
@@ -662,11 +746,15 @@ static void cmd_monitor_si(int fd, uint16_t *regs, uint16_t pr_mask, uint32_t ti
 				}
 				else
 					dprintf(fd, "X4 %d VC %d", rd8.x4, rd8.vc);
+				if (rtp_mask & _BM(8)) {
+				  // RTPlus is on GT8.
+				  display_rtplus(fd, rd8.hdr.rds, rd2.rt);
+				}
 				dprintf(fd, "%s\n", log ? "" : clr_eol);
 			}
 
 			if (mask & _BM(9))
-				print_rds(fd, &rds[9], log);
+			  print_rds(fd, &rds[9], log);
 
 			if (mask & _BM(10)) {
 				print_rds_hdr(fd, &rd10.hdr);
@@ -675,13 +763,21 @@ static void cmd_monitor_si(int fd, uint16_t *regs, uint16_t pr_mask, uint32_t ti
 			}
 			
 			if (mask & _BM(11))
-				print_rds(fd, &rds[11], log);
+			  print_rds(fd, &rds[11], log);
 			
-			if (mask & _BM(12))
-				print_rds(fd, &rds[12], log);
+			if (mask & _BM(12)) {
+			  if (rtp_mask & _BM(12)) {
+				// RTPlus is on GT12.
+				print_rds_hdr(fd, &rds[12]);
+				display_rtplus(fd, rds[12].rds, rd2.rt);
+				dprintf(fd, "%s\n", log ? "" : clr_eol);
+			  } else {
+				print_rds(fd, &rds[11], log);
+			  }
+			}
 
 			if (mask & _BM(13))
-				print_rds(fd, &rds[13], log);
+			  print_rds(fd, &rds[13], log);
 
 			if (mask & _BM(14)) {
 				print_rds_hdr(fd, &rd14.hdr);
@@ -697,7 +793,8 @@ static void cmd_monitor_si(int fd, uint16_t *regs, uint16_t pr_mask, uint32_t ti
 			}
 
 			if (mask & _BM(15))
-				print_rds(fd, &rds[15], log);
+			  print_rds(fd, &rds[15], log);
+
 		}
 		else {
 			rpi_delay_ms(30);
