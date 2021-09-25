@@ -138,36 +138,6 @@ int cmd_dump(int fd, char *arg __attribute__((unused)))
 	return CLI_ENODEV;
 }
 
-static int get_ps_si(char *ps_name, uint16_t *regs, int timeout)
-{ 
-	int dt = 0;
-	rds_gt00a_t rd;
-	memset(&rd, 0, sizeof(rd));
-
-	while(dt < timeout) {
-		if (rd.valid == 0x0F)
-			break;
-		si_read_regs(regs);
-		if (regs[STATUSRSSI] & RDSR) {
-			// basic tuning and switching information
-			if (RDS_GET_GT(regs[RDSB]) == RDS_GT_00A) {
-				memcpy(rd.hdr.rds, &regs[RDSA], sizeof(rd.hdr.rds));
-				rds_parse_gt00a(rd.hdr.rds, &rd);
-			}
-			rpi_delay_ms(40); // Wait for the RDS bit to clear
-			dt += 40;
-		}
-		else {
-			rpi_delay_ms(30);
-			dt += 30;
-		}
-	}
-	strcpy(ps_name, rd.ps);
-	if (rd.valid == 0x0F)
-		return rd.hdr.rds[0];
-	return -1;
-}
-
 static void pi_to_station_id(int pi, char *station_id)
 {
   // station_id points to a char[5] array.
@@ -189,6 +159,61 @@ static void pi_to_station_id(int pi, char *station_id)
   }
   // Terminate the string.
   station_id[4] = '\0';
+}
+
+static void scan_for_rds_st(uint8_t *prds, uint16_t *ppi, uint8_t *pst, uint8_t *pblera)
+{
+  uint16_t si_regs[16];
+  int stop = 0;
+  uint8_t st = 0, rds = 0, blera = 99;
+  uint8_t seen_rdsr_low = 0;
+  uint16_t pi = 0;
+  int dt = 0;
+
+  while(dt < 1000) {
+	si_read_regs(si_regs);
+	// We have to wait for NOT(RDSR) to avoid re-reading the RDS from the previous station.
+	if ((si_regs[STATUSRSSI] & RDSR) == 0)
+	  seen_rdsr_low = 1;
+	if (si_regs[STATUSRSSI] & STEREO)
+	  st = 1;
+	// We have to wait for RDSS (sync) *and* a newly-ready RDS read (RDSR)
+	// before we can try to read the PI (program identifier code).
+	if (seen_rdsr_low &&
+		(si_regs[STATUSRSSI] & (RDSS | RDSR)) == (RDSS | RDSR)) {
+	  rds = 1;
+	  // Read the RDS A bit error rate.
+	  uint8_t this_blera = (si_regs[STATUSRSSI] & BLERA) >> 9; // / (BLERA & (~(BLERA << 1)));
+	  if (this_blera < blera) {
+		// Record the PI from the read with the lowest bit error rate.
+		// In theory, any blera < 3 should be error-corrected.
+		pi = si_regs[RDSA];
+		blera = this_blera;
+	  }
+	}
+	// If we've had a zero-error read of the PI RDS, we can stop checking.
+	if ((blera == 0) || is_stop(&stop)) break;
+	rpi_delay_ms(10);
+	dt += 10;
+  }
+  // Return rds, st, and pi.
+  *prds = rds;
+  *pst = st;
+  *ppi = pi;
+  *pblera = rds * blera;  // if rds == 0, report blera = 0.
+}
+
+static void display_station_info(int fd, int freq, int rssi, int rds, int pi, int st, int blera)
+{
+  char station_id[] = "----";
+  if (rds) {
+	pi_to_station_id(pi, station_id);
+  }
+  dprintf(fd, "%s%c%s %5d ", station_id, blera ? '?' : ' ', st ? "ST" : "  ", freq);
+  for(int si = 0; si < rssi; si++)
+	dprintf(fd, "-");
+  dprintf(fd, " %d", rssi);
+  dprintf(fd, "\n");
 }
 
 int cmd_scan(int fd, char *arg)
@@ -254,50 +279,14 @@ int cmd_scan(int fd, char *arg)
 		nstations++;
 		uint8_t rssi = si_regs[STATUSRSSI]	& RSSI;
 		
-		uint8_t st = 0, rds = 0, blera = 99;
-		uint8_t seen_rdsr_low = 0;
+		uint8_t st = 0, rds = 0, blera = 0;
 		uint16_t pi = 0;
-		int dt = 0;
 		if (rssi > RSSI_LIMIT) {
-		  while(dt < 1000) {
-				si_read_regs(si_regs);
-				// We have to wait for NOT(RDSR) to avoid re-reading the RDS from the previous station.
-				if ((si_regs[STATUSRSSI] & RDSR) == 0)
-				  seen_rdsr_low = 1;
-				if (si_regs[STATUSRSSI] & STEREO)
-				  st = 1;
-				// We have to wait for RDSS (sync) *and* a newly-ready RDS read (RDSR)
-				// before we can try to read the PI (program identifier code).
-				if (seen_rdsr_low &&
-					(si_regs[STATUSRSSI] & (RDSS | RDSR)) == (RDSS | RDSR)) {
-				  rds = 1;
-				  // Read the RDS A bit error rate.
-				  uint8_t this_blera = (si_regs[STATUSRSSI] & BLERA) >> 9; // / (BLERA & (~(BLERA << 1)));
-				  if (this_blera < blera) {
-					// Record the PI from the read with the lowest bit error rate.
-					// In theory, any blera < 3 should be error-corrected.
-					pi = si_regs[RDSA];
-					blera = this_blera;
-				  }
-				}
-				// If we've had a zero-error read of the PI RDS, we can stop checking.
-				if ((blera == 0) || is_stop(&stop)) break;
-				rpi_delay_ms(10);
-				dt += 10;
-			}
-		}
-		
-		char station_id[] = "----";
-		if (rds) {
-		  pi_to_station_id(pi, station_id);
-		}
-		dprintf(fd, "%s %s %5d ", station_id, st ? "ST" : "  ", freq);
-		for(int si = 0; si < rssi; si++)
-			dprintf(fd, "-");
-		dprintf(fd, " %d", rssi);
-		dprintf(fd, "\n");
+		  scan_for_rds_st(&rds, &pi, &st, &blera);
+		}		
+		display_station_info(fd, freq, rssi, rds, pi, st, blera);
 	}
-	
+		
 	si_regs[POWERCFG] &= ~SKMODE; // restore wrap mode
 	si_tune(si_regs, seek);
 
@@ -330,7 +319,8 @@ int cmd_spectrum(int fd, char *arg)
 		rpi_delay_ms(10);
 
 		while(1) {
-			si_read_regs(si_regs);
+ 		    // Wait for "Seek/Tune Complete" (STC).
+		    si_read_regs(si_regs);
 			if (si_regs[STATUSRSSI] & STC) break;
 			if (is_stop(&stop)) break;
 			rpi_delay_ms(10);
@@ -344,37 +334,15 @@ int cmd_spectrum(int fd, char *arg)
 			rpi_delay_ms(10);
 		}
 
+		int freq = si_band[band][0] + i*si_space[space];
 		uint8_t rssi = si_regs[STATUSRSSI]	& 0xFF;
-		dprintf(fd, "%5d ", si_band[band][0] + i*si_space[space]);
-		for(int si = 0; si < rssi; si++)
-			dprintf(fd, "-");
-		dprintf(fd, " %d", rssi);
 
-		int dt = 0;
+		uint8_t st = 0, rds = 0, blera = 0;
+		uint16_t pi = 0;
 		if (rssi > rssi_limit) {
-			while(dt < 3000) {
-				si_read_regs(si_regs);
-				if (si_regs[STATUSRSSI] & STEREO) break;
-				if (is_stop(&stop)) break;
-				rpi_delay_ms(10);
-				dt += 10;
-			}
-		}
-		uint16_t st = si_regs[STATUSRSSI] & STEREO;
-
-		if (st) {
-			dprintf(fd, " ST");
-			if (rssi > rssi_limit) {
-				int pi;
-				char ps_name[16];
-				if ((pi = get_ps_si(ps_name, si_regs, 5000)) != -1) {
-				  char station_id[5];
-				  pi_to_station_id(pi, station_id);
-				  dprintf(fd, " %04X %s '%s'", pi, station_id, ps_name);
-				}
-			}
-		}
-		dprintf(fd, "\n");
+		  scan_for_rds_st(&rds, &pi, &st, &blera);
+		}		
+		display_station_info(fd, freq, rssi, rds, pi, st, blera);
 	}
 	return 0;
 }
